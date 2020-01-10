@@ -7,15 +7,14 @@
 
 Summary: Apache module to intercept login form submission and run PAM authentication
 Name: mod_intercept_form_submit
-Version: 0.9.8
-Release: 2%{?dist}
+Version: 1.1.0
+Release: 1%{?dist}
 License: ASL 2.0
 Group: System Environment/Daemons
 URL: http://www.adelton.com/apache/mod_intercept_form_submit/
 Source0: http://www.adelton.com/apache/mod_intercept_form_submit/%{name}-%{version}.tar.gz
 BuildRequires: httpd-devel
 BuildRequires: pkgconfig
-Requires(pre): httpd
 Requires: httpd-mmn = %{_httpd_mmn}
 Requires: mod_authnz_pam >= 0.7
 
@@ -63,6 +62,9 @@ install -Dp -m 0644 intercept_form_submit.confx $RPM_BUILD_ROOT%{_httpd_confdir}
 %{_httpd_moddir}/*.so
 
 %changelog
+* Mon Mar 13 2017 Tibor Dudlák <tdudlak@redhat.com> - 1.1.0-1
+- Rebase to upstream release 1.1.0.
+
 * Mon Jun 30 2014 Jan Pazdziora <jpazdziora@redhat.com> - 0.9.8-1
 - 1109923 - Fix module loading/configuration for Apache 2.4.
 - Document the runtime dependency on pam_authenticate_with_login_password.

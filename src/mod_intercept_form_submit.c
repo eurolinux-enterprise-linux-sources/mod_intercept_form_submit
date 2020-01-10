@@ -1,6 +1,6 @@
 
 /*
- * Copyright 2013--2014 Jan Pazdziora
+ * Copyright 2013--2016 Jan Pazdziora
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -31,6 +31,7 @@ typedef struct ifs_config {
 	char * pam_service;
 	apr_hash_t * login_blacklist;
 	int clear_blacklisted;
+	int success_to_get;
 	apr_array_header_t * realms;
 } ifs_config;
 
@@ -43,6 +44,12 @@ typedef struct {
 
 
 module AP_MODULE_DECLARE_DATA intercept_form_submit_module;
+
+#ifdef APLOG_USE_MODULE
+#define SHOW_MODULE ""
+#else
+#define SHOW_MODULE "mod_intercept_form_submit: "
+#endif
 
 APR_DECLARE_OPTIONAL_FN(authn_status, pam_authenticate_with_login_password,
 	(request_rec * r, const char * pam_service,
@@ -78,6 +85,7 @@ static const command_rec directives[] = {
 	AP_INIT_TAKE1("InterceptFormPAMService", ap_set_string_slot, (void *)APR_OFFSETOF(ifs_config, pam_service), ACCESS_CONF, "PAM service to authenticate against"),
 	AP_INIT_ITERATE("InterceptFormLoginSkip", add_login_to_blacklist, NULL, ACCESS_CONF, "Login name(s) for which no PAM authentication will be done"),
 	AP_INIT_FLAG("InterceptFormClearRemoteUserForSkipped", ap_set_flag_slot, (void *)APR_OFFSETOF(ifs_config, clear_blacklisted), ACCESS_CONF, "When authentication is skipped for users listed with InterceptFormLoginSkip, clear r->user and REMOTE_USER"),
+	AP_INIT_FLAG("InterceptGETOnSuccess", ap_set_flag_slot, (void *)APR_OFFSETOF(ifs_config, success_to_get), ACCESS_CONF, "When authentication passes, turn the POST request to GET internally"),
 	AP_INIT_ITERATE("InterceptFormLoginRealms", add_realm, NULL, ACCESS_CONF, "Realm(s) that will be appended to login name which does not have one"),
 	{ NULL }
 };
@@ -170,7 +178,7 @@ static authn_status pam_authenticate_in_realms(request_rec * r, const char * pam
 #define _REDACTED_STRING "[REDACTED]"
 static void intercept_form_redact_password(ap_filter_t * f, ifs_config * config) {
 	request_rec * r = f->r;
-	ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, r->server, "will redact password (value of %s) in the POST data", config->password_name);
+	ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, SHOW_MODULE "will redact password (value of %s) in the POST data", config->password_name);
 	ifs_filter_ctx_t * ctx = f->ctx;
 	apr_bucket * b = ctx->password_fragment_start_bucket;
 	int fragment_start_bucket_offset = ctx->password_fragment_start_bucket_offset;
@@ -224,7 +232,7 @@ static void intercept_form_redact_password(ap_filter_t * f, ifs_config * config)
 			apr_off_t content_length;
 			apr_status_t status = apr_strtoff(&content_length, orig_content_length, &end, 10);
 			if (status != APR_SUCCESS || *end || end == orig_content_length || content_length < 0) {
-				ap_log_error(APLOG_MARK, APLOG_ERR, 0, r->server, "Failed to parse the original Content-Length value %s, cannot update it after redacting password, clearing", orig_content_length);
+				ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, SHOW_MODULE "Failed to parse the original Content-Length value %s, cannot update it after redacting password, clearing", orig_content_length);
 				apr_table_unset(r->headers_in, "Content-Length");
 			} else {
 				apr_table_setn(r->headers_in, "Content-Length", apr_psprintf(r->pool, "%ld", content_length - password_remove_length + new_password_data_length));
@@ -234,7 +242,7 @@ static void intercept_form_redact_password(ap_filter_t * f, ifs_config * config)
 }
 
 static int intercept_form_submit_process_buffer(ap_filter_t * f, ifs_config * config, char ** login_value, char ** password_value,
-	const char * buffer, int buffer_length, apr_bucket * fragment_start_bucket, int fragment_start_bucket_offset) {
+	const char * buffer, int buffer_length, apr_bucket * fragment_start_bucket, int fragment_start_bucket_offset, authn_status * out_status) {
 	char * sep = memchr(buffer, '=', buffer_length);
 	if (! sep) {
 		return 0;
@@ -245,11 +253,11 @@ static int intercept_form_submit_process_buffer(ap_filter_t * f, ifs_config * co
 		*login_value = intercept_form_submit_process_keyval(r->pool, config->login_name,
 			buffer, sep - buffer, sep + 1, buffer_length - (sep - buffer) - 1);
 		if (*login_value) {
-			ap_log_error(APLOG_MARK, APLOG_INFO, 0, r->server,
-				"mod_intercept_form_submit: login found in POST: %s=%s", config->login_name, *login_value);
+			ap_log_rerror(APLOG_MARK, APLOG_INFO, 0, r,
+				SHOW_MODULE "login found in POST: %s=%s", config->login_name, *login_value);
 			if (config->login_blacklist && apr_hash_get(config->login_blacklist, *login_value, APR_HASH_KEY_STRING)) {
-				ap_log_error(APLOG_MARK, APLOG_INFO, 0, r->server,
-					"mod_intercept_form_submit: login %s in blacklist, stopping", *login_value);
+				ap_log_rerror(APLOG_MARK, APLOG_INFO, 0, r,
+					SHOW_MODULE "login %s in blacklist, stopping", *login_value);
 				if (config->clear_blacklisted > 0) {
 					apr_table_unset(r->subprocess_env, _REMOTE_USER_ENV_NAME);
 					r->user = NULL;
@@ -265,8 +273,8 @@ static int intercept_form_submit_process_buffer(ap_filter_t * f, ifs_config * co
 		*password_value = intercept_form_submit_process_keyval(r->pool, config->password_name,
 			buffer, sep - buffer, sep + 1, buffer_length - (sep - buffer) - 1);
 		if (*password_value) {
-			ap_log_error(APLOG_MARK, APLOG_INFO, 0, r->server,
-				"mod_intercept_form_submit: password found in POST: %s=" _REDACTED_STRING, config->password_name);
+			ap_log_rerror(APLOG_MARK, APLOG_INFO, 0, r,
+				SHOW_MODULE "password found in POST: %s=" _REDACTED_STRING, config->password_name);
 			if (*login_value) {
 				run_auth = 1;
 			}
@@ -277,10 +285,10 @@ static int intercept_form_submit_process_buffer(ap_filter_t * f, ifs_config * co
 	}
 	if (run_auth) {
 		if (! pam_authenticate_with_login_password_fn) {
-			ap_log_error(APLOG_MARK, APLOG_ERR, 0, r->server, "mod_intercept_form_submit: pam_authenticate_with_login_password not found; perhaps mod_authnz_pam is not loaded");
+			ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, SHOW_MODULE "pam_authenticate_with_login_password not found; perhaps mod_authnz_pam is not loaded");
 			return 0;
 		}
-		pam_authenticate_in_realms(r, config->pam_service, *login_value, *password_value, config->realms, 3);
+		(*out_status) = pam_authenticate_in_realms(r, config->pam_service, *login_value, *password_value, config->realms, 3);
 		if (config->password_redact > 0) {
 			intercept_form_redact_password(f, config);
 		}
@@ -301,9 +309,9 @@ static apr_status_t intercept_form_submit_filter(ap_filter_t * f, apr_bucket_bri
 	return ap_get_brigade(f->next, bb, mode, block, readbytes);
 }
 
-static void intercept_form_submit_filter_prefetch(request_rec * r, ifs_config * config, ap_filter_t * f) {
+static apr_status_t intercept_form_submit_filter_prefetch(request_rec * r, ifs_config * config, ap_filter_t * f) {
 	if (r->status != 200)
-		return;
+		return DECLINED;
 
 	ifs_filter_ctx_t * ctx = f->ctx;
 	if (! ctx) {
@@ -318,6 +326,8 @@ static void intercept_form_submit_filter_prefetch(request_rec * r, ifs_config * 
 	int fragment_length = 0;
 	apr_bucket * fragment_start_bucket = NULL;
 	int fragment_start_bucket_offset = 0;
+
+	authn_status out_status = AUTH_GENERAL_ERROR;
 
 	apr_bucket_brigade * bb = apr_brigade_create(f->c->pool, f->c->bucket_alloc);
 	int fetch_more = 1;
@@ -334,8 +344,8 @@ static void intercept_form_submit_filter_prefetch(request_rec * r, ifs_config * 
 			if (APR_BUCKET_IS_EOS(b)) {
 				if (fragment)
 					intercept_form_submit_process_buffer(f, config, &login_value, &password_value,
-						fragment, fragment_length, fragment_start_bucket, fragment_start_bucket_offset);
-				ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, r->server, "hit EOS");
+						fragment, fragment_length, fragment_start_bucket, fragment_start_bucket_offset, &out_status);
+				ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, SHOW_MODULE "hit EOS");
 				fetch_more = 0;
 				break;
 			}
@@ -357,7 +367,7 @@ static void intercept_form_submit_filter_prefetch(request_rec * r, ifs_config * 
 					fragment = realloc(fragment, new_length);
 					memcpy(fragment + fragment_length, p, e - p);
 					if (intercept_form_submit_process_buffer(f, config, &login_value, &password_value,
-						fragment, new_length, fragment_start_bucket, fragment_start_bucket_offset)) {
+						fragment, new_length, fragment_start_bucket, fragment_start_bucket_offset, &out_status)) {
 						fetch_more = 0;
 						break;
 					}
@@ -365,7 +375,7 @@ static void intercept_form_submit_filter_prefetch(request_rec * r, ifs_config * 
 					fragment = NULL;
 				} else {
 					if (intercept_form_submit_process_buffer(f, config, &login_value, &password_value,
-						p, e - p, b, (p - buffer))) {
+						p, e - p, b, (p - buffer), &out_status)) {
 						fetch_more = 0;
 						break;
 					}
@@ -384,7 +394,7 @@ static void intercept_form_submit_filter_prefetch(request_rec * r, ifs_config * 
 				} else if (APR_BUCKET_NEXT(b) && APR_BUCKET_IS_EOS(APR_BUCKET_NEXT(b))) {
 					/* shortcut if this is the last bucket, slurp the rest */
 					intercept_form_submit_process_buffer(f, config, &login_value, &password_value,
-						p, nbytes, b, (p - buffer));
+						p, nbytes, b, (p - buffer), &out_status);
 					fetch_more = 0;
 				} else {
 					fragment = malloc(nbytes);
@@ -398,22 +408,23 @@ static void intercept_form_submit_filter_prefetch(request_rec * r, ifs_config * 
 	}
 	if (fragment)
 		free(fragment);
+	return out_status == AUTH_GRANTED ? OK : DECLINED;
 }
 
 #define _INTERCEPT_CONTENT_TYPE "application/x-www-form-urlencoded"
 static apr_status_t intercept_form_submit_init(request_rec * r) {
-	ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, r->server, "intercept_form_submit_init invoked");
+	ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, SHOW_MODULE "intercept_form_submit_init invoked");
 	if (r->method_number != M_POST) {
-		ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, r->server, "skipping, no POST request");
+		ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, SHOW_MODULE "skipping, no POST request");
 		return DECLINED;
 	}
 	ifs_config * config = ap_get_module_config(r->per_dir_config, &intercept_form_submit_module);
 	if (!(config && config->login_name && config->password_name && config->pam_service)) {
-		ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, r->server, "skipping, not configured");
+		ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, SHOW_MODULE "skipping, not configured");
 		return DECLINED;
 	}
 	if (apr_table_get(r->subprocess_env, _REMOTE_USER_ENV_NAME)) {
-		ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, r->server, "skipping, " _REMOTE_USER_ENV_NAME " already set");
+		ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, SHOW_MODULE "skipping, " _REMOTE_USER_ENV_NAME " already set");
 		return DECLINED;
 	}
 	const char * content_type = apr_table_get(r->headers_in, "Content-Type");
@@ -426,12 +437,19 @@ static apr_status_t intercept_form_submit_init(request_rec * r) {
 		apr_collapse_spaces(content_type_pure, content_type_pure);
 		if (!apr_strnatcasecmp(content_type_pure, _INTERCEPT_CONTENT_TYPE)) {
 			ap_filter_t * the_filter = ap_add_input_filter("intercept_form_submit_filter", NULL, r, r->connection);
-			ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, r->server, "inserted filter intercept_form_submit_filter, starting intercept_form_submit_filter_prefetch");
-			intercept_form_submit_filter_prefetch(r, config, the_filter);
+			ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, SHOW_MODULE "inserted filter intercept_form_submit_filter, starting intercept_form_submit_filter_prefetch");
+			apr_status_t status = intercept_form_submit_filter_prefetch(r, config, the_filter);
+			if (status == OK && config->success_to_get >= 0) {
+				ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, SHOW_MODULE "intercept_form_submit_filter_prefetch returned OK, turning the method to GET");
+				r->status_line = NULL;
+				r->method = "GET";
+				r->method_number = M_GET;
+				apr_table_unset(r->headers_in, "Content-Length");
+			}
 			return DECLINED;
 		}
 	}
-	ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, r->server, "skipping, no " _INTERCEPT_CONTENT_TYPE);
+	ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, SHOW_MODULE "skipping, no " _INTERCEPT_CONTENT_TYPE);
 	return DECLINED;
 }
 
@@ -439,6 +457,7 @@ static void * create_dir_conf(apr_pool_t * pool, char * dir) {
 	ifs_config * cfg = apr_pcalloc(pool, sizeof(ifs_config));
 	cfg->password_redact = -1;
 	cfg->clear_blacklisted = -1;
+	cfg->success_to_get = -1;
 	return cfg;
 }
 
@@ -449,6 +468,7 @@ static void * merge_dir_conf(apr_pool_t * pool, void * base_void, void * add_voi
 	cfg->login_name = add->login_name ? add->login_name : base->login_name;
 	cfg->password_name = add->password_name ? add->password_name : base->password_name;
 	cfg->password_redact = add->password_redact >= 0 ? add->password_redact : base->password_redact;
+	cfg->success_to_get = add->success_to_get >= 0 ? add->success_to_get : base->success_to_get;
 	cfg->clear_blacklisted = add->clear_blacklisted >= 0 ? add->clear_blacklisted : base->clear_blacklisted;
 	cfg->pam_service = add->pam_service ? add->pam_service : base->pam_service;
 	if (add->login_blacklist) {
@@ -470,7 +490,12 @@ static void register_hooks(apr_pool_t * pool) {
 	ap_hook_optional_fn_retrieve(register_pam_authenticate_with_login_password_fn, NULL, NULL, APR_HOOK_MIDDLE);
 }
 
-module AP_MODULE_DECLARE_DATA intercept_form_submit_module = {
+#ifdef AP_DECLARE_MODULE
+AP_DECLARE_MODULE(intercept_form_submit)
+#else
+module AP_MODULE_DECLARE_DATA intercept_form_submit_module
+#endif
+	= {
 	STANDARD20_MODULE_STUFF,
 	create_dir_conf,		/* Per-directory configuration handler */
 	merge_dir_conf,			/* Merge handler for per-directory configurations */
